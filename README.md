@@ -4,7 +4,8 @@ Run VMs with Microsoft's Hyper-V compatible device model on Proxmox/KVM using [O
 
 OpenVMM is a Type-2 VMM written in Rust by Microsoft. On Linux it runs on top of KVM (`/dev/kvm`), using Hyper-V devices (VMBus, storvsp, netvsp) instead of QEMU's virtio devices.
 
-> **Note**: Microsoft warns that OpenVMM on Linux is not yet ready for end-user workloads. Expect rapid changes -- always backup before updating.
+> **Note**: Microsoft warns that OpenVMM on Linux is not yet ready for end-user workloads. 
+> Expect rapid changes -- always keep a backup of your openvmm executable before updating it.
 
 ## What's Included
 
