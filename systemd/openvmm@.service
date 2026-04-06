@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenVMM VM %i
+After=network.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/ovm setup-net %i
+ExecStart=/usr/local/bin/ovm run %i
+ExecStartPost=/usr/local/bin/ovm setup-vnc-forward %i
+ExecStopPost=-/usr/local/bin/ovm teardown-vnc-forward %i
+ExecStopPost=-/usr/local/bin/ovm teardown-net %i
+KillMode=process
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

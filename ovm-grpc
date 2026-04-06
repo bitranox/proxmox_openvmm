@@ -1,0 +1,70 @@
+#!/opt/ovm-web/venv/bin/python3
+"""gRPC client for openvmm VM management."""
+import sys
+import os
+sys.path.insert(0, "/opt/ovm-web")
+
+import grpc
+import vmservice_pb2
+import vmservice_pb2_grpc
+from google.protobuf.empty_pb2 import Empty
+
+def get_channel(vmid):
+    sock = f"/var/run/openvmm/{vmid}.sock"
+    if not os.path.exists(sock):
+        print(f"ERROR: gRPC socket not found: {sock}", file=sys.stderr)
+        sys.exit(1)
+    return grpc.insecure_channel(
+        f"unix://{sock}",
+        options=[("grpc.default_authority", "localhost")],
+    )
+
+def cmd_quit(vmid):
+    """Send Quit to gracefully stop the openvmm process."""
+    with get_channel(vmid) as ch:
+        stub = vmservice_pb2_grpc.VMStub(ch)
+        stub.Quit(Empty(), timeout=10)
+        print(f"Quit sent to VM {vmid}")
+
+def cmd_pause(vmid):
+    with get_channel(vmid) as ch:
+        stub = vmservice_pb2_grpc.VMStub(ch)
+        stub.PauseVM(Empty(), timeout=10)
+        print(f"VM {vmid} paused")
+
+def cmd_resume(vmid):
+    with get_channel(vmid) as ch:
+        stub = vmservice_pb2_grpc.VMStub(ch)
+        stub.ResumeVM(Empty(), timeout=10)
+        print(f"VM {vmid} resumed")
+
+def cmd_teardown(vmid):
+    with get_channel(vmid) as ch:
+        stub = vmservice_pb2_grpc.VMStub(ch)
+        stub.TeardownVM(Empty(), timeout=10)
+        print(f"VM {vmid} torn down")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: ovm-grpc <quit|pause|resume|teardown> <vmid>")
+        sys.exit(1)
+
+    action = sys.argv[1]
+    vmid = sys.argv[2]
+
+    actions = {
+        "quit": cmd_quit,
+        "pause": cmd_pause,
+        "resume": cmd_resume,
+        "teardown": cmd_teardown,
+    }
+
+    if action not in actions:
+        print(f"Unknown action: {action}. Use: {', '.join(actions.keys())}")
+        sys.exit(1)
+
+    try:
+        actions[action](vmid)
+    except grpc.RpcError as e:
+        print(f"gRPC error: {e.code()}: {e.details()}", file=sys.stderr)
+        sys.exit(1)

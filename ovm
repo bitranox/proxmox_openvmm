@@ -1,0 +1,404 @@
+#!/bin/bash
+# ovm - OpenVMM VM manager for Proxmox
+# Reads Proxmox VM config and starts VMs with openvmm instead of QEMU
+
+set -euo pipefail
+
+OPENVMM_BIN="/usr/local/bin/openvmm"
+PVE_CONF_DIR="/etc/pve/qemu-server"
+RUN_DIR="/var/run/openvmm"
+LOG_DIR="/var/log/openvmm"
+
+# Parse a Proxmox VM config file and return value for a key
+parse_conf() {
+    local vmid="$1" key="$2"
+    grep -m1 "^${key}:" "${PVE_CONF_DIR}/${vmid}.conf" 2>/dev/null | sed "s/^${key}:[[:space:]]*//"
+}
+
+# Build the openvmm command line from VM config
+build_cmd() {
+    local vmid="$1"
+    local conf="${PVE_CONF_DIR}/${vmid}.conf"
+
+    if [ ! -f "$conf" ]; then
+        echo "ERROR: Config file $conf not found" >&2
+        return 1
+    fi
+
+    local args
+    args=$(parse_conf "$vmid" "args")
+
+    local cmd=("$OPENVMM_BIN")
+
+    # Auto-translate memory (unless overridden in args)
+    if ! echo "$args" | grep -q -- "--memory"; then
+        local memory
+        memory=$(parse_conf "$vmid" "memory")
+        if [ -n "$memory" ]; then
+            cmd+=(--memory "${memory}MB")
+        fi
+    fi
+
+    # Auto-translate processors (unless overridden in args)
+    if ! echo "$args" | grep -q -- "--processors"; then
+        local cores sockets procs
+        cores=$(parse_conf "$vmid" "cores")
+        sockets=$(parse_conf "$vmid" "sockets")
+        cores="${cores:-1}"
+        sockets="${sockets:-1}"
+        procs=$((cores * sockets))
+        cmd+=(--processors "$procs")
+    fi
+
+    # Auto-translate network (unless overridden in args)
+    if ! echo "$args" | grep -q -- "--net"; then
+        local net0 bridge
+        net0=$(parse_conf "$vmid" "net0")
+        if [ -n "$net0" ]; then
+            bridge=$(echo "$net0" | grep -oP 'bridge=\K[^,]+')
+            bridge="${bridge:-vmbr0}"
+            cmd+=(--net "tap:tap${vmid}i0")
+        fi
+    fi
+
+    # Add gRPC socket for management if not using --gfx (gRPC breaks VNC in multi-process)
+    if ! echo "$args" | grep -q -- "--grpc" && ! echo "$args" | grep -q -- "--gfx"; then
+        cmd+=(--grpc "/var/run/openvmm/${vmid}.sock")
+    fi
+
+    # Append all args verbatim
+    if [ -n "$args" ]; then
+        # Use eval to handle quoted paths properly
+        eval "cmd+=($args)"
+    fi
+
+    echo "${cmd[@]}"
+}
+
+# Extract bridge name from net0 config
+get_bridge() {
+    local vmid="$1"
+    local net0
+    net0=$(parse_conf "$vmid" "net0")
+    local bridge
+    bridge=$(echo "$net0" | grep -oP 'bridge=\K[^,]+')
+    echo "${bridge:-vmbr0}"
+}
+
+# Create tap device and bridge it
+setup_net() {
+    local vmid="$1"
+    local tap="tap${vmid}i0"
+    local bridge
+    bridge=$(get_bridge "$vmid")
+
+    if ip link show "$tap" &>/dev/null; then
+        echo "Tap $tap already exists, reusing"
+        ip link set "$tap" up
+        return 0
+    fi
+
+    echo "Creating tap $tap on bridge $bridge"
+    ip tuntap add dev "$tap" mode tap
+    ip link set "$tap" master "$bridge"
+    ip link set "$tap" up
+}
+
+# Remove tap device
+teardown_net() {
+    local vmid="$1"
+    local tap="tap${vmid}i0"
+
+    if ip link show "$tap" &>/dev/null; then
+        echo "Removing tap $tap"
+        ip link set "$tap" down
+        ip link delete "$tap"
+    fi
+}
+
+# Get external VNC port (internal + 10000, e.g. 5999 -> 15999)
+get_ext_vnc_port() {
+    local vmid="$1"
+    local vnc_port
+    vnc_port=$(build_cmd "$vmid" 2>/dev/null | grep -oP -- '--vnc-port \K\d+' || echo "")
+    [ -n "$vnc_port" ] && echo $((vnc_port + 10000)) || echo ""
+}
+
+# Forward VNC port to 0.0.0.0 via socat (openvmm binds to localhost only)
+setup_vnc_forward() {
+    local vmid="$1"
+    local vnc_port ext_port
+    vnc_port=$(build_cmd "$vmid" | grep -oP -- '--vnc-port \K\d+' || echo "")
+    [ -z "$vnc_port" ] && return 0
+    ext_port=$((vnc_port + 10000))
+
+    # Kill any existing forwarder
+    teardown_vnc_forward "$vmid"
+
+    # Stop any previous instance
+    systemctl stop "openvmm-vnc-${vmid}" 2>/dev/null
+    systemctl reset-failed "openvmm-vnc-${vmid}" 2>/dev/null
+
+    echo "Forwarding VNC: 0.0.0.0:${ext_port} -> 127.0.0.1:${vnc_port}"
+    systemd-run --unit="openvmm-vnc-${vmid}" --description="VNC forward for VM ${vmid}" \
+        socat TCP-LISTEN:${ext_port},bind=0.0.0.0,fork,reuseaddr TCP:127.0.0.1:${vnc_port}
+}
+
+# Stop VNC port forwarding
+teardown_vnc_forward() {
+    local vmid="$1"
+
+    systemctl stop "openvmm-vnc-${vmid}" 2>/dev/null
+    rm -f "${RUN_DIR}/${vmid}.vnc.pid"
+}
+
+# Run openvmm (used by systemd ExecStart)
+# Uses 'script' to allocate a PTY so --com1 console works in multi-process mode
+run() {
+    local vmid="$1"
+    local cmd
+    cmd=$(build_cmd "$vmid")
+
+    echo "Starting openvmm for VM $vmid"
+    echo "Command: $cmd"
+    echo "---"
+
+    # Store PID
+    mkdir -p "$RUN_DIR"
+    echo $$ > "${RUN_DIR}/${vmid}.pid"
+
+    # If --disable-frontpage is in the command, run directly (no PTY needed)
+    # Otherwise, use 'script' to provide a PTY for the interactive frontpage/console
+    if echo "$cmd" | grep -q -- "--disable-frontpage"; then
+        exec $cmd
+    else
+        exec script -qfc "$cmd" /dev/null
+    fi
+}
+
+# Start VM via tmux (interactive, with --com1 console)
+start() {
+    local vmid="$1"
+
+    # Check if already running
+    if systemctl is-active --quiet "openvmm@${vmid}" 2>/dev/null; then
+        echo "VM $vmid is already running"
+        return 1
+    fi
+
+    # Setup network first
+    setup_net "$vmid"
+
+    # Start via systemd
+    systemctl start "openvmm@${vmid}"
+
+    sleep 2
+    if systemctl is-active --quiet "openvmm@${vmid}"; then
+        local vnc_port
+        vnc_port=$(build_cmd "$vmid" | grep -oP -- '--vnc-port \K\d+' || echo "none")
+
+        # Forward VNC to all interfaces
+        sleep 3  # wait for openvmm VNC to be ready
+        setup_vnc_forward "$vmid"
+
+        local host_ip ext_port
+        host_ip=$(hostname -I | awk '{print $1}')
+        ext_port=$((vnc_port + 10000))
+        echo "VM $vmid started successfully"
+        echo "VNC: connect to ${host_ip}:${ext_port} (direct, no SSH tunnel needed)"
+        echo "Status: ovm status $vmid"
+        echo "Console: ovm console $vmid"
+    else
+        echo "ERROR: VM $vmid failed to start. Check: journalctl -u openvmm@${vmid}" >&2
+        return 1
+    fi
+}
+
+# Stop VM (graceful via gRPC, then fallback to systemctl stop)
+stop() {
+    local vmid="$1"
+
+    if ! systemctl is-active --quiet "openvmm@${vmid}" 2>/dev/null; then
+        if [ -f "${RUN_DIR}/${vmid}.pid" ]; then
+            local pid
+            pid=$(cat "${RUN_DIR}/${vmid}.pid")
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "Stopping openvmm VM $vmid (PID $pid)"
+                kill "$pid"
+                sleep 2
+                kill -9 "$pid" 2>/dev/null
+            fi
+            rm -f "${RUN_DIR}/${vmid}.pid"
+        else
+            echo "VM $vmid is not running"
+            return 0
+        fi
+    else
+        echo "Stopping VM $vmid..."
+        systemctl stop "openvmm@${vmid}"
+    fi
+
+    teardown_vnc_forward "$vmid"
+    teardown_net "$vmid"
+    rm -f "${RUN_DIR}/${vmid}.sock"
+    echo "VM $vmid stopped"
+}
+
+
+# Show VM status
+status() {
+    local vmid="${1:-}"
+
+    if [ -n "$vmid" ]; then
+        local conf="${PVE_CONF_DIR}/${vmid}.conf"
+        if [ ! -f "$conf" ]; then
+            echo "VM $vmid: config not found"
+            return 1
+        fi
+        local name
+        name=$(parse_conf "$vmid" "name")
+        local running="stopped"
+        if systemctl is-active --quiet "openvmm@${vmid}" 2>/dev/null; then
+            running="running"
+        elif [ -f "${RUN_DIR}/${vmid}.pid" ] && kill -0 "$(cat "${RUN_DIR}/${vmid}.pid")" 2>/dev/null; then
+            running="running (unmanaged)"
+        fi
+        local vnc_port
+        vnc_port=$(build_cmd "$vmid" 2>/dev/null | grep -oP -- '--vnc-port \K\d+' || echo "n/a")
+        printf "%-8s %-25s %-10s VNC: %s\n" "$vmid" "${name:-unnamed}" "$running" "$vnc_port"
+    else
+        # List all openvmm VMs (those with hookscript set to openvmm-guard)
+        echo "VMID     NAME                      STATUS     VNC"
+        echo "-------- ------------------------- ---------- --------"
+        for conf in "${PVE_CONF_DIR}"/*.conf; do
+            [ -f "$conf" ] || continue
+            local id
+            id=$(basename "$conf" .conf)
+            if grep -q "hookscript:.*openvmm-guard" "$conf" 2>/dev/null || \
+               grep -q "^args:.*openvmm\|^args:.*--hypervisor\|^args:.*--uefi-firmware.*MSVM" "$conf" 2>/dev/null; then
+                status "$id"
+            fi
+        done
+    fi
+}
+
+# Show generated openvmm command (dry run)
+config() {
+    local vmid="$1"
+    echo "# VM $vmid openvmm command:"
+    echo ""
+    build_cmd "$vmid" | tr ' ' '\n' | sed 's/^/  /'
+    echo ""
+    echo "# Network: tap${vmid}i0 -> $(get_bridge "$vmid")"
+}
+
+# Register VM for openvmm management
+register() {
+    local vmid="$1"
+    local conf="${PVE_CONF_DIR}/${vmid}.conf"
+
+    if [ ! -f "$conf" ]; then
+        echo "ERROR: Config $conf not found" >&2
+        return 1
+    fi
+
+    if grep -q "hookscript:" "$conf"; then
+        echo "WARNING: VM $vmid already has a hookscript, replacing"
+        qm set "$vmid" --hookscript local:snippets/openvmm-guard.sh
+    else
+        qm set "$vmid" --hookscript local:snippets/openvmm-guard.sh
+    fi
+    echo "VM $vmid registered for openvmm (hookscript set)"
+}
+
+# Unregister VM
+unregister() {
+    local vmid="$1"
+    qm set "$vmid" --delete hookscript 2>/dev/null || true
+    echo "VM $vmid unregistered from openvmm (hookscript removed)"
+}
+
+# Print VNC connection info
+vnc() {
+    local vmid="$1"
+    local vnc_port
+    vnc_port=$(build_cmd "$vmid" 2>/dev/null | grep -oP -- '--vnc-port \K\d+' || echo "")
+
+    if [ -z "$vnc_port" ]; then
+        echo "No VNC port configured for VM $vmid"
+        return 1
+    fi
+
+    local host_ip
+    host_ip=$(hostname -I | awk '{print $1}')
+
+    local ext_port=$((vnc_port + 10000))
+    echo "VNC direct: ${host_ip}:${ext_port} (via socat forwarder)"
+    echo ""
+    echo "Or via SSH tunnel:"
+    echo "  ssh -4 -N -L ${vnc_port}:127.0.0.1:${vnc_port} root@${host_ip}"
+    echo "  Then connect to: localhost:${vnc_port}"
+}
+
+# Attach to console (if VM uses tmux)
+console() {
+    local vmid="$1"
+    echo "Checking for serial log at ${LOG_DIR}/${vmid}-serial.log"
+    if [ -f "${LOG_DIR}/${vmid}-serial.log" ]; then
+        tail -f "${LOG_DIR}/${vmid}-serial.log"
+    else
+        echo "No serial log found. VM may use --com1 console (attach via tmux)."
+        echo "Check: journalctl -u openvmm@${vmid} -f"
+    fi
+}
+
+# Main dispatcher
+usage() {
+    echo "Usage: ovm <command> [vmid]"
+    echo ""
+    echo "Commands:"
+    echo "  start <vmid>       Start an openvmm VM"
+    echo "  stop <vmid>        Stop an openvmm VM"
+    echo "  status [vmid]      Show VM status (all if no vmid)"
+    echo "  config <vmid>      Show generated openvmm command (dry run)"
+    echo "  register <vmid>    Register VM for openvmm (set guard hookscript)"
+    echo "  unregister <vmid>  Unregister VM (remove hookscript)"
+    echo "  vnc <vmid>         Show VNC connection info"
+    echo "  console <vmid>     Attach to serial console log"
+    echo ""
+    echo "Internal (used by systemd):"
+    echo "  run <vmid>         Run openvmm (exec, used by systemd ExecStart)"
+    echo "  setup-net <vmid>   Create tap device"
+    echo "  teardown-net <vmid> Remove tap device"
+}
+
+cmd="${1:-}"
+vmid="${2:-}"
+
+case "$cmd" in
+    start|stop|config|register|unregister|vnc|console|run|setup-net|teardown-net|setup-vnc-forward|teardown-vnc-forward)
+        if [ -z "$vmid" ]; then
+            echo "ERROR: vmid required" >&2
+            usage
+            exit 1
+        fi
+        case "$cmd" in
+            setup-net) setup_net "$vmid" ;;
+            teardown-net) teardown_net "$vmid" ;;
+            setup-vnc-forward) setup_vnc_forward "$vmid" ;;
+            teardown-vnc-forward) teardown_vnc_forward "$vmid" ;;
+            *) "$cmd" "$vmid" ;;
+        esac
+        ;;
+    status)
+        status "$vmid"
+        ;;
+    -h|--help|help|"")
+        usage
+        ;;
+    *)
+        echo "ERROR: Unknown command '$cmd'" >&2
+        usage
+        exit 1
+        ;;
+esac

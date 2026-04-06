@@ -1,0 +1,13 @@
+[Unit]
+Description=OpenVMM Web UI
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/ovm-web/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8008 --ssl-keyfile /etc/pve/local/pve-ssl.key --ssl-certfile /etc/pve/local/pve-ssl.pem
+WorkingDirectory=/opt/ovm-web
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
